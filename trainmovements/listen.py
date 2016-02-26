@@ -5,6 +5,7 @@ import json
 import os
 import time
 
+import boto3
 import stomp
 
 from pprint import pprint
@@ -20,6 +21,7 @@ import locations
 HOSTNAME = 'datafeeds.networkrail.co.uk'
 CHANNEL = 'TRAIN_MVT_ALL_TOC'  # See http://nrodwiki.rockshore.net/index.php/Train_Movements
 LOG = None
+AWS_SNS_TOPIC_ARN = os.environ['AWS_SNS_TOPIC_ARN']
 
 
 def JsonSerializer(obj):
@@ -129,7 +131,7 @@ class TrainMovementsMessage(object):
 
     @property
     def event_type(self):
-        EventType.get(self.raw['event_type'])
+        return EventType.get(self.raw['event_type'])
 
     @property
     def status(self):
@@ -336,18 +338,21 @@ class TrainMovementsMessage(object):
         # return self._decode_???(self.raw['train_file_address'])
 
     @property
+    def minutes_late(self):
+        return int(
+            (self.actual_datetime - self.planned_datetime).total_seconds() / 60
+        )
+
+    @property
     def early_late_description(self):
         if not self.actual_datetime or not self.planned_datetime:
             return '[unknown]'
 
-        mins_late = (
-            self.actual_datetime - self.planned_datetime).total_seconds() / 60
-
         if self.status is VariationStatus.late:
-            return '{} mins late'.format(mins_late)
+            return '{} mins late'.format(self.minutes_late)
 
         elif self.status is VariationStatus.early:
-            return '{} mins early'.format(-mins_late)
+            return '{} mins early'.format(-self.minutes_late)
 
         elif self.status is VariationStatus.on_time:
             return 'on time'
@@ -408,6 +413,11 @@ class TrainMovementsMessage(object):
 
 
 class TrainMovementsListener(object):
+    def __init__(self):
+        self.region_name = 'eu-west-1'
+        self.sns = boto3.resource('sns', self.region_name)
+        self.topic = self.sns.Topic(AWS_SNS_TOPIC_ARN)
+
     def on_error(self, headers, message):
         LOG.error("ERROR: {} {}".format(headers, message))
 
@@ -426,19 +436,23 @@ class TrainMovementsListener(object):
         header = raw_message['header']
 
         if not self._validate_header(header):
-            LOG.debug('Dropping invalid message due to header')
             return
 
         decoded = TrainMovementsMessage(raw_message['body'])
-        print(decoded)
-        return
 
-        stanox = body.get('loc_stanox')
-        if stanox == '72410':  # euston
-            print("\n**** EUSTON ****\n")
-            pprint(message)
+        if (decoded.event_type == EventType.arrival and
+                decoded.status == VariationStatus.late and
+                decoded.minutes_late >= 10 and
+                decoded.location.three_alpha is not None):
+
+            print(decoded)
+            self.topic.publish(Message=str(decoded))
         else:
-            print("somewhere else ({})".format(stanox))
+            LOG.debug('Dropping {} {} {} message'.format(
+                decoded.status, decoded.event_type,
+                decoded.early_late_description))
+
+        return
 
     @staticmethod
     def _validate_header(header):
@@ -456,8 +470,8 @@ class TrainMovementsListener(object):
         """
 
         if header['msg_type'] != '0003':
-            LOG.error('Message type was `{}`, expected `0003`. This "cannot" '
-                      'happen'.format(header['msg_type']))
+            LOG.debug('Dropping unsupported message type `{}`'.format(
+                header['msg_type']))
             return False
 
         return True
