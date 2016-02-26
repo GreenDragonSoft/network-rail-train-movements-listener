@@ -5,6 +5,7 @@ import json
 import os
 import time
 
+import boto3
 import stomp
 
 from pprint import pprint
@@ -20,6 +21,7 @@ import locations
 HOSTNAME = 'datafeeds.networkrail.co.uk'
 CHANNEL = 'TRAIN_MVT_ALL_TOC'  # See http://nrodwiki.rockshore.net/index.php/Train_Movements
 LOG = None
+AWS_SNS_TOPIC_ARN = os.environ['AWS_SNS_TOPIC_ARN']
 
 
 def JsonSerializer(obj):
@@ -411,6 +413,11 @@ class TrainMovementsMessage(object):
 
 
 class TrainMovementsListener(object):
+    def __init__(self):
+        self.region_name = 'eu-west-1'
+        self.sns = boto3.resource('sns', self.region_name)
+        self.topic = self.sns.Topic(AWS_SNS_TOPIC_ARN)
+
     def on_error(self, headers, message):
         LOG.error("ERROR: {} {}".format(headers, message))
 
@@ -429,19 +436,23 @@ class TrainMovementsListener(object):
         header = raw_message['header']
 
         if not self._validate_header(header):
-            LOG.debug('Dropping invalid message due to header')
             return
 
         decoded = TrainMovementsMessage(raw_message['body'])
-        print(decoded)
-        return
 
-        stanox = body.get('loc_stanox')
-        if stanox == '72410':  # euston
-            print("\n**** EUSTON ****\n")
-            pprint(message)
+        if (decoded.event_type == EventType.arrival and
+                decoded.status == VariationStatus.late and
+                decoded.minutes_late >= 10 and
+                decoded.location.three_alpha is not None):
+
+            print(decoded)
+            self.topic.publish(Message=str(decoded))
         else:
-            print("somewhere else ({})".format(stanox))
+            LOG.debug('Dropping {} {} {} message'.format(
+                decoded.status, decoded.event_type,
+                decoded.early_late_description))
+
+        return
 
     @staticmethod
     def _validate_header(header):
