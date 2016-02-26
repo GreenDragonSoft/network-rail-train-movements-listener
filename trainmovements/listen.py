@@ -470,8 +470,8 @@ class TrainMovementsListener(object):
         """
 
         if header['msg_type'] != '0003':
-            LOG.error('Message type was `{}`, expected `0003`. This "cannot" '
-                      'happen'.format(header['msg_type']))
+            LOG.debug('Dropping unsupported message type `{}`'.format(
+                header['msg_type']))
             return False
 
         return True
