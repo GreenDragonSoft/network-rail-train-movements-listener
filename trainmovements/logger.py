@@ -20,13 +20,13 @@ sh.setFormatter(formatter)
 
 # set up logging to a file for all levels DEBUG and higher
 fh = logging.handlers.RotatingFileHandler(
-    DEBUG_LOG_FILENAME, maxBytes=TEN_MEGABYTES)
+    DEBUG_LOG_FILENAME, maxBytes=TEN_MEGABYTES, backupCount=10)
 fh.setLevel(logging.DEBUG)
 fh.setFormatter(formatter)
 
 # set up logging to a file for all levels WARNING and higher
 fh2 = logging.handlers.RotatingFileHandler(
-    WARNING_LOG_FILENAME, maxBytes=HUNDRED_MEGABYTES)
+    WARNING_LOG_FILENAME, maxBytes=HUNDRED_MEGABYTES, backupCount=3)
 fh2.setLevel(logging.WARN)
 fh2.setFormatter(formatter)
 
