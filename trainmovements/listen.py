@@ -8,19 +8,16 @@ import time
 import boto3
 import stomp
 
-from pprint import pprint
 from collections import OrderedDict
 from enum import Enum
 
-import logging
-
 import operating_companies
 import locations
+from logger import LOG
 
 
 HOSTNAME = 'datafeeds.networkrail.co.uk'
 CHANNEL = 'TRAIN_MVT_ALL_TOC'  # See http://nrodwiki.rockshore.net/index.php/Train_Movements
-LOG = None
 AWS_SNS_TOPIC_ARN = os.environ['AWS_SNS_TOPIC_ARN']
 
 
@@ -433,6 +430,8 @@ class TrainMovementsListener(object):
         http://nrodwiki.rockshore.net/index.php/Train_Movement
 
         """
+        LOG.debug('Raw STOMP message: {}'.format(raw_message))
+
         header = raw_message['header']
 
         if not self._validate_header(header):
@@ -445,7 +444,10 @@ class TrainMovementsListener(object):
                 decoded.minutes_late >= 10 and
                 decoded.location.three_alpha is not None):
 
-            print(decoded)
+            LOG.info('{} arrival at {} ({})'.format(
+                decoded.early_late_description, decoded.location.name,
+                decoded.location.three_alpha))
+            LOG.debug('Publishing message: {}'.format(decoded))
             self.topic.publish(Message=str(decoded))
         else:
             LOG.debug('Dropping {} {} {} message'.format(
@@ -478,10 +480,6 @@ class TrainMovementsListener(object):
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
-    global LOG
-    LOG = logging.getLogger('')
-
     username = os.environ['NR_DATAFEEDS_USERNAME']
     password = os.environ['NR_DATAFEEDS_PASSWORD']
 
