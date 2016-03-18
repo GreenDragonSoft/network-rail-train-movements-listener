@@ -1,503 +1,116 @@
 #!/usr/bin/env python3
 
-import datetime
 import json
 import os
 import time
+import uuid
 
 import boto3
 import stomp
 
-from collections import OrderedDict
-from enum import Enum
-
-import operating_companies
-import locations
 from logger import LOG
 
-
-HOSTNAME = 'datafeeds.networkrail.co.uk'
-CHANNEL = 'TRAIN_MVT_ALL_TOC'  # See http://nrodwiki.rockshore.net/index.php/Train_Movements
-AWS_SNS_TOPIC_ARN = os.environ['AWS_SNS_TOPIC_ARN']
+from batcher import batcher
 
 
-def JsonSerializer(obj):
-    """JSON serializer for objects not serializable by default json code"""
-
-    if isinstance(obj, datetime.datetime):
-        serial = obj.isoformat()
-        return serial
-
-    elif isinstance(obj, Enum):
-        return obj.name
-
-    elif hasattr(obj, 'serialize'):
-        return obj.serialize()
-
-    raise TypeError("Type `{}` not serializable".format(type(obj)))
+LOG_EVERY_N_MESSAGES = 1000
 
 
-class VariationStatus(Enum):
-    """
-    One of "ON TIME", "EARLY", "LATE" or "OFF ROUTE"
-    """
-    on_time = 1
-    early = 2
-    late = 3
-    off_route = 4
+class UploadStompMessagesToAmazonSQS(object):
+    def __init__(self, sqs_queue_url, region_name='eu-west-1'):
+        self.sent_message_count = 0
+        self.sent_bytes = 0
 
-    @classmethod
-    def get(cls, string):
-        return {
-            'ON TIME': VariationStatus.on_time,
-            'EARLY': VariationStatus.early,
-            'LATE': VariationStatus.late,
-            'OFF ROUTE': VariationStatus.off_route,
-        }[string]
-
-
-class EventType(Enum):
-    """
-    One of "ARRIVAL", "DEPARTURE" or "DESTINATION"
-    """
-    arrival = 1
-    departure = 2
-    destination = 3
-
-    @classmethod
-    def get(cls, string):
-        return {
-            'ARRIVAL': EventType.arrival,
-            'DEPARTURE': EventType.departure,
-            'DESTINATION': EventType.destination,
-        }[string]
-
-
-class TrainMovementsMessage(object):
-    """
-    Decodes and represents a Train Movements Message. The raw message looks
-    something like:
-    ```
-    {
-        "status": "LATE",
-        "planned_timestamp": "1455883470000",
-        "event_type": "DEPARTURE",
-        "train_terminated": "false",
-        "direction_ind": "UP",
-        "toc_id": "88",
-        "auto_expected": "true",
-        "event_source": "AUTOMATIC",
-        "reporting_stanox": "87701",
-        "gbtt_timestamp": "1455883440000",
-        "platform": " 1",
-        "correction_ind": "false",
-        "original_loc_stanox": "",
-        "planned_event_type": "DEPARTURE",
-        "timetable_variation": "2",
-        "delay_monitoring_point": "true",
-        "line_ind": "F",
-        "next_report_stanox": "87700",
-        "train_id": "892A39MI19",
-        "offroute_ind": "false",
-        "current_train_id": "",
-        "loc_stanox": "87701",
-        "next_report_run_time": "1",
-        "route": "2",
-        "train_file_address": null,
-        "division_code": "88",
-        "actual_timestamp": "1455883560000",
-        "original_loc_timestamp": "",
-        "train_service_code": "24745000"
-    },
-    ```
-    """
-
-    def __init__(self, raw):
-        self.raw = raw
-        self._validate_assumptions()
-
-    def _validate_assumptions(self):
-        assert self.division_code == self.operating_company
-
-    def __str__(self):
-        return json.dumps(self.serialize(), indent=4, default=JsonSerializer)
-
-    @property
-    def planned_event_type(self):
-        return EventType.get(self.raw['planned_event_type'])
-
-    @property
-    def event_type(self):
-        return EventType.get(self.raw['event_type'])
-
-    @property
-    def status(self):
-        return VariationStatus.get(self.raw['variation_status'])
-
-    @property
-    def planned_datetime(self):
-        return self._decode_timestamp(self.raw['planned_timestamp'])
-
-    @property
-    def actual_datetime(self):
-        return self._decode_timestamp(self.raw['actual_timestamp'])
-
-    @property
-    def planned_timetable_datetime(self):
-        return self._decode_timestamp(self.raw['gbtt_timestamp'])
-
-    @property
-    def location(self):
-        """
-        The location on the rail network at which this event happened.
-        """
-        return self._decode_stanox(self.raw['loc_stanox'])
-
-    @property
-    def location_stanox(self):
-        return self.raw['loc_stanox']
-
-    @property
-    def is_correction(self):
-        return self._decode_boolean(self.raw['correction_ind'])
-
-    @property
-    def train_terminated(self):
-        """
-        Set to "true" if the train has completed its journey, or "false"
-        otherwise.
-        """
-        return self._decode_boolean(self.raw['train_terminated'])
-
-    @property
-    def operating_company(self):
-        """
-        """
-        return self._decode_operating_company(self.raw['toc_id'])
-
-    @property
-    def division_code(self):
-        """
-        Operating company ID as per TOC Codes
-        """
-        return self._decode_operating_company(self.raw['division_code'])
-
-    @property
-    def train_service_code(self):
-        """
-        Train service code as per schedule
-        eg. "24745000"
-        """
-        return self.raw['train_service_code']
-
-    @property
-    def train_id(self):
-        """
-        The 10-character unique identity for this train at TRUST activation
-        time
-        """
-        return self.raw['train_id']
-
-    @property
-    def is_off_route(self):
-        """
-        Set to False if this report is for a location in the schedule, or
-        True if it is not.
-        """
-        return self._decode_boolean(self.raw['offroute_ind'])
-
-    @property
-    def current_train_id(self):
-        """
-        Where a train has had its identity changed, the current 10-character
-        unique identity for this train.
-        """
-        return self.raw['current_train_id']
-
-    @property
-    def original_location(self):
-        """
-        If the location has been revised, the location in the schedule at
-        activation time
-        """
-        return self._decode_stanox(self.raw['original_loc_stanox'])
-
-    @property
-    def original_location_planned_departure_datetime(self):
-        """
-        The planned departure time associated with the original location
-        """
-        return self._decode_timestamp(self.raw['original_loc_timestamp'])
-
-    @property
-    def direction(self):
-        """
-        For automatic reports, either "UP" or "DOWN" depending on the direction
-        of travel
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['direction_ind'])
-
-    @property
-    def auto_expected(self):
-        """
-        Set to "true" if an automatic report is expected for this location,
-        otherwise "false"
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['auto_expected'])
-
-    @property
-    def event_source(self):
-        """
-        Whether the event source was "AUTOMATIC" from SMART, or "MANUAL" from
-        TOPS or TRUST SDR
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['event_source'])
-
-    @property
-    def reporting_location(self):
-        """
-        The location that generated this report. Set to "00000" for manual and
-        off-route reports.
-        """
-        raise NotImplementedError()
-        # return self._decode_stanox(self.raw['reporting_stanox'])
-
-    @property
-    def platform(self):
-        """
-        Two characters (including a space for a single character) or blank if
-        the movement report is associated with a platform number
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['platform'])
-
-    @property
-    def timetable_variation(self):
-        """
-        The number of minutes variation from the scheduled time at this
-        location. Off-route reports will contain "0"
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['timetable_variation'])
-
-    @property
-    def delay_monitoring_point(self):
-        """
-        Set to True if this is a delay monitoring point, False if it is
-        not. Off-route reports will contain False.
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['delay_monitoring_point'])
-
-    @property
-    def line_ind(self):
-        """
-        A single character (or blank) depending on the line the train is
-        travelling on, e.g. F = Fast, S = Slow
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['line_ind'])
-
-    @property
-    def next_report_location(self):
-        """
-        The location at which the next report for this train is due
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['next_report_stanox'])
-
-    @property
-    def next_report_run_time(self):
-        """
-        The running time to the next location.
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['next_report_run_time'])
-
-    @property
-    def route(self):
-        """
-        A single character (or blank) to indicate the exit route from this
-        location
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['route'])
-
-    @property
-    def train_file_address(self):
-        """
-        The TOPS train file address, if applicable.
-        """
-        raise NotImplementedError()
-        # return self._decode_???(self.raw['train_file_address'])
-
-    @property
-    def minutes_late(self):
-        return int(
-            (self.actual_datetime - self.planned_datetime).total_seconds() / 60
-        )
-
-    @property
-    def early_late_description(self):
-        if not self.actual_datetime or not self.planned_datetime:
-            return '[unknown]'
-
-        if self.status is VariationStatus.late:
-            return '{} mins late'.format(self.minutes_late)
-
-        elif self.status is VariationStatus.early:
-            return '{} mins early'.format(-self.minutes_late)
-
-        elif self.status is VariationStatus.on_time:
-            return 'on time'
-
-    def serialize(self):
-        field_names = [
-            'planned_event_type',
-            'status',
-            'planned_datetime',
-            'actual_datetime',
-            'planned_timetable_datetime',
-            'early_late_description',
-            'location',
-            'location_stanox',
-            'operating_company',
-            'is_correction',
-        ]
-        return OrderedDict(
-            [(name, getattr(self, name)) for name in field_names])
-
-    @staticmethod
-    def _decode_boolean(string):
-        if string == 'true':
-            return True
-        elif string == 'false':
-            return False
-        raise ValueError('Invalid boolean: `{}`'.format(string))
-
-    @staticmethod
-    def _decode_stanox(stanox):
-        return locations.from_stanox(stanox)
-
-    @staticmethod
-    def _decode_operating_company(numeric_code):
-        """
-        eg: "88"
-        """
-        if numeric_code == '00':
-            return None
-
-        return operating_companies.from_numeric_code(int(numeric_code))
-
-    @staticmethod
-    def _decode_timestamp(string):
-        """
-        Timestamp appears to be in milliseconds:
-        `1455887700000` : Tue, 31 Mar in the year 48105.
-        `1455887700`    : Fri, 19 Feb 2016 13:15:00 GMT
-        """
-
-        if string == '':
-            return None
-
-        try:
-            return datetime.datetime.fromtimestamp(int(string) / 1000)
-        except ValueError as e:
-            raise ValueError('Choked on `{}`: {}'.format(string, repr(e)))
-
-
-class TrainMovementsListener(object):
-    def __init__(self):
-        self.region_name = 'eu-west-1'
-        self.sns = boto3.resource('sns', self.region_name)
-        self.topic = self.sns.Topic(AWS_SNS_TOPIC_ARN)
+        self.sqs = boto3.resource('sqs', region_name)
+        self.queue = self.sqs.Queue(sqs_queue_url)
 
     def on_error(self, headers, message):
         LOG.error("ERROR: {} {}".format(headers, message))
 
-    def on_message(self, headers, messages):
-        LOG.debug('STOMP headers {}, message: {}'.format(headers, messages))
+    def on_message(self, stomp_headers, json_encoded_messages):
+        LOG.debug('STOMP headers {}'.format(stomp_headers))
 
-        for message in json.loads(messages):
-            self._handle_message(message)
+        try:
+            messages = json.loads(json_encoded_messages)
+        except ValueError as e:
+            LOG.error('Failed to decode {} bytes as JSON: {}'.format(
+                len(json_encoded_messages), json_encoded_messages))
+            LOG.exception(e)
+            return
 
-    def _handle_message(self, raw_message):
+        try:
+            self._handle_multiple_messages(messages)
+        except Exception as e:
+            LOG.exception(e)
+            return
+
+    def _handle_multiple_messages(self, messages):
         """
         Train movement message comprises a `header` and a `body`. The `header`
         http://nrodwiki.rockshore.net/index.php/Train_Movement
 
         """
-        LOG.debug('Raw STOMP message: {}'.format(raw_message))
+        def send_batch(sqs_entries):
+            # http://boto3.readthedocs.org/en/latest/reference/services/sqs.html#SQS.Queue.sendentries
+            result = self.queue.send_messages(Entries=sqs_entries)
 
-        header = raw_message['header']
+            if len(result['Successful']) != len(sqs_entries):
+                LOG.error('Some messages failed to send to SQS: {}'.format(
+                    result))
 
-        if not self._validate_header(header):
-            return
+        with batcher(send_batch, batch_size=10) as b:
+            for raw_message in messages:
+                message_id = str(uuid.uuid4())
 
-        decoded = TrainMovementsMessage(raw_message['body'])
+                pretty_message = json.dumps(raw_message, indent=4)
+                LOG.debug('Sending to queue with id {}: {}'.format(
+                    message_id, pretty_message))
 
-        if (decoded.event_type == EventType.arrival and
-                decoded.status == VariationStatus.late and
-                decoded.minutes_late >= 10 and
-                decoded.location.three_alpha is not None):
+                b.push({
+                    'Id': message_id,
+                    'MessageBody': pretty_message
+                })
 
-            LOG.info('{} arrival at {} ({})'.format(
-                decoded.early_late_description, decoded.location.name,
-                decoded.location.three_alpha))
-            LOG.debug('Publishing message: {}'.format(decoded))
-            self.topic.publish(Message=str(decoded))
-        else:
-            LOG.debug('Dropping {} {} {} message'.format(
-                decoded.status, decoded.event_type,
-                decoded.early_late_description))
+                self.increment_message_counter(len(raw_message))
 
-        return
+    def increment_message_counter(self, num_bytes):
+        self.sent_message_count += 1
+        self.sent_bytes += num_bytes
 
-    @staticmethod
-    def _validate_header(header):
-        """
-        ```
-        "header": {
-            "user_id": "",
-            "msg_type": "0003",
-            "msg_queue_timestamp": "1455883630000",
-            "source_dev_id": "",
-            "original_data_source": "SMART",
-            "source_system_id": "TRUST"
-        }
-        ```
-        """
-
-        if header['msg_type'] != '0003':
-            LOG.debug('Dropping unsupported message type `{}`'.format(
-                header['msg_type']))
-            return False
-
-        return True
+        if self.sent_message_count % LOG_EVERY_N_MESSAGES == 0:
+            LOG.info('Sent {} messages, ~{:.3f} MB'.format(
+                self.sent_message_count,
+                self.sent_bytes / (1024 * 1024)))
 
 
 def main():
     username = os.environ['NR_DATAFEEDS_USERNAME']
     password = os.environ['NR_DATAFEEDS_PASSWORD']
 
-    conn = create_data_feed_connection(HOSTNAME, username, password, CHANNEL)
+    # See http://nrodwiki.rockshore.net/index.php/Train_Movements
+    datafeeds_hostname = 'datafeeds.networkrail.co.uk'
+    datafeeds_channel = 'TRAIN_MVT_ALL_TOC'
+
+    handler = UploadStompMessagesToAmazonSQS(os.environ['AWS_SQS_QUEUE_URL'])
+
+    conn = create_data_feed_connection(
+        datafeeds_hostname, username, password, datafeeds_channel, handler)
 
     while True:
         try:
             time.sleep(1)
         except KeyboardInterrupt:
-            print("Quitting.")
+            LOG.info("Keyboard interrupt, quitting.")
             break
 
     conn.disconnect()
 
 
-def create_data_feed_connection(hostname, username, password, channel):
+def create_data_feed_connection(hostname, username, password, channel,
+                                handler):
     conn = stomp.Connection(host_and_ports=[(hostname, 61618)])
-    conn.set_listener('mylistener', TrainMovementsListener())
+
+    conn.set_listener('mylistener', handler)
     conn.start()
     conn.connect(username=username, passcode=password)
 
