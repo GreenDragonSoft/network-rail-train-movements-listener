@@ -36,3 +36,6 @@ LOG.setLevel(logging.DEBUG)
 LOG.addHandler(sh)
 LOG.addHandler(fh)
 LOG.addHandler(fh2)
+
+LOG.info('Logging to {} and {}'.format(
+         DEBUG_LOG_FILENAME, WARNING_LOG_FILENAME))
